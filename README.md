@@ -84,6 +84,31 @@ You can also configure it at the project level by creating a `.mcp.json` file in
 
 Codex uses the same `.mcp.json` project-level configuration as Claude Code (see above). Place the `.mcp.json` file in the project root and Codex will pick it up automatically.
 
+### Adding to OpenCode
+
+Add the server to your OpenCode MCP configuration. Edit (or create) the file `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "ScyllaDB Jenkins": {
+      "type": "local",
+      "command": [
+        "node",
+        "/path/to/jenkins-mcp/server.js"
+      ],
+      "environment": {
+        "JENKINS_USER": "your-username",
+        "JENKINS_TOKEN": "your-api-token"
+      }
+    }
+  }
+}
+```
+
+Replace `/path/to/jenkins-mcp/server.js` with the absolute path to `server.js`, and fill in your credentials. `JENKINS_URL` defaults to `https://jenkins.scylladb.com` and can be omitted.
+
 ### Running Standalone (for testing)
 
 ```bash
