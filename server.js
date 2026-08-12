@@ -80,6 +80,13 @@ function buildResult(result) {
   return result === null || result === undefined ? "RUNNING" : result;
 }
 
+function truncateTrace(trace, maxLines) {
+  if (!trace) return "";
+  const lines = trace.replace(/\s+$/, "").split("\n");
+  if (lines.length <= maxLines) return lines.join("\n");
+  return lines.slice(0, maxLines).join("\n") + `\n    ... (${lines.length - maxLines} more lines)`;
+}
+
 // --- MCP Server ---
 
 const server = new McpServer({
@@ -222,6 +229,109 @@ server.tool(
       text = text.slice(0, 50_000) + "\n\n... (output truncated) ...\n\n" + text.slice(-50_000);
     }
     return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "get_test_report",
+  "Get the published JUnit/xUnit test report for a build — failing test cases with class name, status, age and stack trace. Prefer this over grepping console output when a build published test results.",
+  {
+    job_name: z.string().describe("Full job path."),
+    build_number: z.string().optional().default("lastBuild").describe("Build number or 'lastBuild'."),
+    status_filter: z.array(z.string()).optional().default(["FAILED", "REGRESSION"])
+      .describe("Case statuses to report. Pass an empty array to report every case."),
+    max_cases: z.number().optional().default(50).describe("Maximum number of cases to list."),
+    include_stack_trace: z.boolean().optional().default(true).describe("Include each case's error stack trace."),
+    stack_trace_lines: z.number().optional().default(15).describe("Lines of each stack trace to keep."),
+  },
+  async ({ job_name, build_number, status_filter, max_cases, include_stack_trace, stack_trace_lines }) => {
+    const path = jobPath(job_name);
+    const reportPath = `${path}/${build_number}/testReport/api/json`;
+    const caseFields = "className,name,status,age,duration,errorDetails,errorStackTrace";
+    let data;
+    try {
+      data = await jenkinsGet(reportPath, {
+        tree:
+          `failCount,passCount,skipCount,duration,suites[name,cases[${caseFields}]],` +
+          `childReports[child[number,url],result[failCount,passCount,skipCount,suites[name,cases[${caseFields}]]]]`,
+      });
+    } catch {
+      // Some Jenkins versions reject a tree that names fields absent from this
+      // report type — retry unprojected before giving up.
+      try {
+        data = await jenkinsGet(reportPath);
+      } catch (e) {
+        return {
+          content: [{
+            type: "text",
+            text: `No test report available for ${job_name} #${build_number}: ${e.message}\n` +
+              "The build may have failed before publishing results, or the job may not publish JUnit XML at all.",
+          }],
+        };
+      }
+    }
+
+    // A report is either flat (suites at the top level) or aggregated over
+    // child builds (childReports[].result.suites).
+    const reports = Array.isArray(data.childReports) && data.childReports.length
+      ? data.childReports.filter((cr) => cr.result).map((cr) => ({
+        label: cr.child?.url || (cr.child?.number != null ? `#${cr.child.number}` : null),
+        result: cr.result,
+      }))
+      : [{ label: null, result: data }];
+
+    const cases = [];
+    let failCount = 0, passCount = 0, skipCount = 0;
+    for (const { label, result } of reports) {
+      failCount += result.failCount || 0;
+      passCount += result.passCount || 0;
+      skipCount += result.skipCount || 0;
+      for (const suite of result.suites || []) {
+        for (const c of suite.cases || []) {
+          cases.push({ ...c, suite: suite.name, report: label });
+        }
+      }
+    }
+
+    const wanted = (status_filter || []).map((s) => s.toUpperCase());
+    const matching = wanted.length
+      ? cases.filter((c) => wanted.includes((c.status || "").toUpperCase()))
+      : cases;
+    matching.sort((a, b) =>
+      (a.className || "").localeCompare(b.className || "") || (a.name || "").localeCompare(b.name || ""));
+
+    const header = [
+      `# Test report — ${job_name} #${build_number}`,
+      `Totals: ${passCount} passed, ${failCount} failed, ${skipCount} skipped (${cases.length} cases in report)`,
+    ];
+    if (reports.length > 1) header.push(`Aggregated over ${reports.length} child report(s).`);
+    if (!matching.length) {
+      const filterDesc = wanted.length ? ` with status ${wanted.join("/")}` : "";
+      header.push(`\nNo cases${filterDesc}.`);
+      return { content: [{ type: "text", text: header.join("\n") }] };
+    }
+
+    const shown = matching.slice(0, max_cases);
+    header.push(`\nShowing ${shown.length} of ${matching.length} matching case(s):`);
+    const lines = [...header];
+    for (const c of shown) {
+      lines.push("");
+      lines.push(`## ${c.className || "?"}.${c.name || "?"}`);
+      const meta = [`Status: ${c.status || "?"}`, `Age: ${c.age ?? "?"}`];
+      if (c.duration) meta.push(`Duration: ${formatDuration(c.duration * 1000)}`);
+      if (c.report) meta.push(`Child: ${c.report}`);
+      lines.push(meta.join("   "));
+      if (c.errorDetails) lines.push(`Error: ${c.errorDetails}`);
+      if (include_stack_trace && c.errorStackTrace) {
+        lines.push("```");
+        lines.push(truncateTrace(c.errorStackTrace, stack_trace_lines));
+        lines.push("```");
+      }
+    }
+    if (matching.length > shown.length) {
+      lines.push(`\n... ${matching.length - shown.length} more matching case(s) not shown (max_cases=${max_cases}).`);
+    }
+    return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 );
 
